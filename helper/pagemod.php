@@ -8,7 +8,9 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
 
     var $patterns;
     var $values;
+    var $pagename;
     protected $template_section_id;
+    protected $pagemod_auth;
 
     /**
      * Handle the user input [required]
@@ -36,15 +38,23 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
             # shortcut to modify the same page as the submitter
             $page_to_modify = $ID;
         } else {
+            $page_to_modify = $this->replace($page_to_modify);
+            $myns = getNS($ID);
             //resolve against page which contains the form
-            resolve_pageid(getNS($ID), $page_to_modify, $ignored);
+            resolve_pageid($myns, $page_to_modify, $ignored);
+            
         }
-
-        $template_section_id = cleanID(array_shift($argv));
-
+        $template_section_id = cleanID($this->replace(array_shift($argv)));
         if(!page_exists($page_to_modify)) {
             msg(sprintf($this->getLang('e_pagenotexists'), html_wikilink($page_to_modify)), -1);
             return false;
+        }
+        
+        $params = array_map('trim', explode(",", array_shift($argv)));
+        
+        $redirect = true;
+        if(in_array('noredirect', $params)) {
+            $redirect = false;
         }
 
         // check auth
@@ -53,9 +63,9 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
         // This is good for admins to be able to only allow people to modify a page via a certain method.  If you want to protect the page
         // from people to WRITE via this method, deny access to the form page.
         $auth = $this->aclcheck($page_to_modify); // runas
-        if($auth < AUTH_READ) {
-            msg($this->getLang('e_denied'), -1);
-            return false;
+        $pagemod_auth = true;
+        if($auth >= AUTH_READ) {
+            $pagemod_auth = false;
         }
 
         // fetch template
@@ -66,21 +76,73 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
         }
 
         // do the replacements
-        $template = $this->updatePage($template, $template_section_id);
-        if(!$template) {
+        $template_new = $this->updatePage($template, $template_section_id, $pagemod_auth);
+        if(!$template_new) {
+            msg(sprintf($this->getLang('e_failedtoparse'), $page_to_modify), -1);
+            return false;
+        }
+        
+        if($pagemod_auth && $template === $template_new) {
             msg(sprintf($this->getLang('e_failedtoparse'), $page_to_modify), -1);
             return false;
         }
         // save page
-        saveWikiText($page_to_modify, $template, sprintf($this->getLang('summary'), $ID));
-
-        //thanks message with redirect
-        $link = wl($page_to_modify);
-        return sprintf(
-            $this->getLang('pleasewait'),
-            "<script type='text/javascript' charset='utf-8'>location.replace('$link')</script>", // javascript redirect
-            html_wikilink($page_to_modify) //fallback url
-        );
+        saveWikiText($page_to_modify, $template_new, sprintf($this->getLang('summary'), $ID));
+        
+        $this->pagename = $page_to_modify;
+        $this->processUploads($fields);
+        
+        if($redirect) {
+            //thanks message with redirect
+            $link = wl($page_to_modify);
+            return sprintf(
+                $this->getLang('pleasewait'),
+                "<script type='text/javascript' charset='utf-8'>location.replace('$link')</script>", // javascript redirect
+                html_wikilink($page_to_modify) //fallback url
+            ); 
+        } else {
+            return "<p>$thanks</p>" . '<p>' . html_wikilink($ID) . '</p>';
+        }
+    }
+    
+    /**
+     * move the uploaded files to <pagename>:FILENAME
+     *
+     *
+     * @param helper_plugin_bureaucracy_field[] $fields
+     * @throws Exception
+     */
+    protected function processUploads($fields) {
+        $ns = $this->pagename;
+        foreach($fields as $field) {
+            
+            if($field->getFieldType() !== 'file') continue;
+            
+            $label = $field->getParam('label');
+            $file  = $field->getParam('file');
+            
+            //skip empty files
+            if(!$file['size']) {
+                $this->values[$label] = '';
+                continue;
+            }
+            
+            $id = $ns.':'.$file['name'];
+            $id = cleanID($id);
+            
+            $auth = $this->aclcheck($id); // runas
+            $res = media_save(
+                array('name' => $file['tmp_name']),
+                $id,
+                false,
+                $auth,
+                'copy_uploaded_file');
+                
+                if(is_array($res)) throw new Exception($res[0]);
+                
+                $this->values[$label] = $res;
+                
+        }
     }
 
     /**
@@ -129,8 +191,9 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
      * @param string $template_section_id
      * @return string
      */
-    protected function updatePage($template, $template_section_id) {
+    protected function updatePage($template, $template_section_id, $pagemod_auth) {
         $this->template_section_id = $template_section_id;
+        $this->pagemod_auth = $pagemod_auth;
         return preg_replace_callback('/<pagemod (\w+)(?: (.+?))?>(.*?)<\/pagemod>/s', array($this, 'parsePagemod'), $template);
     }
 
@@ -141,6 +204,7 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
      * @return string
      */
     public function parsePagemod($matches) {
+        global $ID;
         // Get all the parameters
         $full_text     = $matches[0];
         $id            = $matches[1];
@@ -149,15 +213,20 @@ class helper_plugin_pagemod_pagemod extends helper_plugin_bureaucracy_action {
 
         // First parse the parameters
         $output_before = true;
+        $auth_page_found = false;
         if($params_string) {
             $params = array_map('trim', explode(",", $params_string));
             foreach($params as $param) {
                 if($param === 'output_after') {
                     $output_before = false;
+                } else if($this->pagemod_auth && $ID === cleanID($param)) {
+                    $auth_page_found = true;
                 }
             }
         }
-
+        
+        if($this->pagemod_auth && !$auth_page_found) return $full_text;
+        
         // We only parse if this template is being matched (Allow multiple forms to update multiple sections of a page)
         if($id === $this->template_section_id) {
             //replace meta variables
